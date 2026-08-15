@@ -1,0 +1,26 @@
+prices_csv: data/raw/prices.csv
+membership_csv: data/raw/membership.csv
+output_dir: data/processed
+
+columns:
+  date: date
+  symbol: symbol
+  open: open
+  high: high
+  low: low
+  close: close
+  volume: volume
+  turnover: turnover
+  tradable: tradable
+  membership_active: is_member
+
+lookback: 20
+graph_window: 60
+graph_min_observations: 55
+graph_neighbors: 10
+feature_winsor_lower: 0.01
+feature_winsor_upper: 0.99
+low_frequency_bins: [0, 1, 2]
+split_ratios: [0.6, 0.2, 0.2]
+purge_dates: 5
+
