@@ -76,8 +76,10 @@ class ExperimentConfig:
             raise ValueError("joint_layers must be positive")
         if self.model.num_bases < 1:
             raise ValueError("num_bases must be positive")
-        if self.model.routing_mode not in {"adaptive", "uniform"}:
-            raise ValueError("routing_mode must be 'adaptive' or 'uniform'")
+        if self.model.routing_mode not in {"adaptive", "uniform", "feature", "direct"}:
+            raise ValueError("unknown routing_mode")
+        if self.model.routing_mode in {"uniform", "feature", "direct"}:
+            self.loss.diversity_weight = 0.0
         if len(self.data.split_ratios) != 3 or abs(sum(self.data.split_ratios) - 1.0) > 1e-6:
             raise ValueError("split_ratios must contain three values that sum to one")
         if self.training.router_warmup_epochs < 0:

@@ -18,11 +18,13 @@ def test_processed_date_loading(tmp_path) -> None:
         market_state=np.zeros(5, dtype=np.float32),
         targets=np.asarray([-1.0, 1.0], dtype=np.float32),
     )
-    manifest = {"splits": {"train": ["train/2025-01-02.npz"]}, "metadata": {}}
+    manifest = {
+        "splits": {"train": ["train/2025-01-02.npz"]},
+        "metadata": {"implementation_version": 2},
+    }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     dataset = CrossSectionDataset(tmp_path, "train")
     item = dataset[0]
     assert item.date == "2025-01-02"
     assert item.num_stocks == 2
     assert item.features.shape == (2, 20, 12)
-

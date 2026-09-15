@@ -23,6 +23,8 @@ class CrossSectionDataset(Dataset[DateBatch]):
         self.split = split
         self.files = tuple(manifest["splits"][split])
         self.metadata = manifest.get("metadata", {})
+        if self.metadata.get("implementation_version") != 2:
+            raise ValueError("rebuild legacy data with version 2 past-only candidate selection")
 
     def __len__(self) -> int:
         return len(self.files)

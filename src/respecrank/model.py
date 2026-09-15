@@ -63,8 +63,8 @@ class ReSpecRank(nn.Module):
         self.graph_order = graph_order
         self.temporal_dilations = tuple(temporal_dilations)
         self.num_bases = num_bases
-        if routing_mode not in {"adaptive", "uniform"}:
-            raise ValueError("routing_mode must be 'adaptive' or 'uniform'")
+        if routing_mode not in {"adaptive", "uniform", "feature", "direct"}:
+            raise ValueError("unknown routing_mode")
         self.routing_mode = routing_mode
 
         self.feature_projection = nn.Linear(feature_dim, hidden_dim)
@@ -86,15 +86,33 @@ class ReSpecRank(nn.Module):
                 hidden_dim,
             )
         )
-        self.layer_norms = nn.ModuleList(
-            [nn.LayerNorm(hidden_dim) for _ in range(joint_layers)]
-        )
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(joint_layers)])
         self.ranking_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+        if routing_mode == "feature":
+            self.feature_conditioner = nn.Sequential(
+                nn.Linear(5, router_hidden_dim),
+                nn.GELU(),
+                nn.Linear(router_hidden_dim, 2 * hidden_dim),
+            )
+        if routing_mode == "direct":
+            self.direct_routers = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(5, router_hidden_dim),
+                        nn.GELU(),
+                        nn.Linear(router_hidden_dim, (graph_order + 1) * len(temporal_dilations)),
+                    )
+                    for _ in range(joint_layers)
+                ]
+            )
+            for router in self.direct_routers:
+                nn.init.zeros_(router[-1].weight)
+                nn.init.zeros_(router[-1].bias)
         self.reset_parameters(coefficient_init_scale)
 
     def reset_parameters(self, coefficient_init_scale: float = 0.1) -> None:
@@ -114,7 +132,7 @@ class ReSpecRank(nn.Module):
         router_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if router_weights is None:
-            if force_uniform_router or self.routing_mode == "uniform":
+            if force_uniform_router or self.routing_mode in {"uniform", "feature", "direct"}:
                 router_weights = torch.full(
                     (self.num_bases,),
                     1.0 / self.num_bases,
@@ -128,6 +146,16 @@ class ReSpecRank(nn.Module):
             router_weights,
             self.coefficient_bases,
         )
+        if self.routing_mode == "direct":
+            # The final biases are the state-independent warm-up surfaces.
+            coefficients = torch.stack(
+                [
+                    (router[-1].bias if force_uniform_router else router(market_state)).reshape(
+                        self.graph_order + 1, len(self.temporal_dilations)
+                    )
+                    for router in self.direct_routers
+                ]
+            )
         return coefficients, router_weights
 
     def forward(
@@ -136,6 +164,7 @@ class ReSpecRank(nn.Module):
         force_uniform_router: bool = False,
         router_weights: torch.Tensor | None = None,
     ) -> ReSpecRankOutput:
+        force_uniform_router = force_uniform_router or getattr(self, "checkpoint_warmup", False)
         if batch.features.ndim != 3:
             raise ValueError("features must have shape [stocks, time, features]")
         if batch.features.shape[-1] != self.feature_dim:
@@ -150,43 +179,40 @@ class ReSpecRank(nn.Module):
             router_weights=router_weights,
         )
 
-        num_stocks, sequence_length, _ = hidden.shape
-        filtered = torch.zeros_like(hidden)
+        # Cache T_p(L_tilde_t) H^(0)_{t,t-d_q} once.
+        # Neither branch reads the preceding residual update.
+        delayed = hidden[:, [-1 - delay for delay in self.temporal_dilations], :]
+        num_stocks = hidden.shape[0]
+        graph_basis = chebyshev_signals(
+            delayed.reshape(num_stocks, -1),
+            batch.edge_index,
+            batch.edge_weight,
+            self.graph_order,
+        )
+        bank = torch.stack(
+            [
+                signal.reshape(num_stocks, len(self.temporal_dilations), self.hidden_dim)
+                for signal in graph_basis
+            ]
+        )
+        hidden = hidden[:, -1, :]
         for layer_index in range(self.joint_layers):
-            # The current point-in-time graph acts on every temporal position.
-            flattened = hidden.reshape(num_stocks, sequence_length * self.hidden_dim)
-            graph_basis = chebyshev_signals(
-                flattened,
-                batch.edge_index,
-                batch.edge_weight,
-                self.graph_order,
+            filtered = torch.einsum(
+                "pnqd,pqde,pq->ne",
+                bank,
+                self.channel_mixing[layer_index],
+                coefficients[layer_index],
             )
-            filtered = torch.zeros_like(hidden)
-            for graph_index, flattened_signal in enumerate(graph_basis):
-                signal = flattened_signal.reshape(
-                    num_stocks,
-                    sequence_length,
-                    self.hidden_dim,
-                )
-                for temporal_index, dilation in enumerate(self.temporal_dilations):
-                    # Slicing implements a causal shift with a zero left boundary.
-                    source = signal[:, : sequence_length - dilation, :]
-                    mixed = source @ self.channel_mixing[
-                        layer_index,
-                        graph_index,
-                        temporal_index,
-                    ]
-                    filtered[:, dilation:, :] = filtered[:, dilation:, :] + (
-                        coefficients[layer_index, graph_index, temporal_index] * mixed
-                    )
             hidden = self.layer_norms[layer_index](hidden + filtered)
-
-        scores = self.ranking_head(hidden[:, -1, :]).squeeze(-1)
+        if self.routing_mode == "feature" and not force_uniform_router:
+            scale, shift = self.feature_conditioner(batch.market_state).chunk(2)
+            hidden = hidden * (1 + scale) + shift
+        scores = self.ranking_head(hidden).squeeze(-1)
         return ReSpecRankOutput(
             scores=scores,
             router_weights=weights,
             coefficients=coefficients,
-            filtered_features=filtered[:, -1, :],
+            filtered_features=filtered,
         )
 
     @classmethod

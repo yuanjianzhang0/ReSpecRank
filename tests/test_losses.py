@@ -20,7 +20,9 @@ def test_joint_response_and_diversity_are_finite() -> None:
     omegas = torch.linspace(0.0, torch.pi, 9)
     response = joint_response(coefficients[0], (0, 1, 2, 4, 8, 16), lambdas, omegas)
     assert response.shape == (8, 9)
-    diversity = spectral_diversity_loss(coefficients, (0, 1, 2, 4, 8, 16), grid_size=8)
+    diversity = spectral_diversity_loss(
+        coefficients, (0, 1, 2, 4, 8, 16), grid_size=8, channel_mixing=torch.randn(4, 6, 3, 3)
+    )
     assert torch.isfinite(diversity)
     diversity.backward()
     assert coefficients.grad is not None
@@ -32,6 +34,7 @@ def test_multilayer_diversity_is_finite() -> None:
         coefficients,
         (0, 1, 2, 4, 8, 16),
         grid_size=8,
+        channel_mixing=torch.randn(2, 4, 6, 3, 3),
     )
     assert torch.isfinite(diversity)
     diversity.backward()

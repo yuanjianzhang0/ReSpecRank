@@ -40,6 +40,7 @@ def evaluate_model(
     loader: DataLoader,
     device: torch.device,
     shuffled_states: list[torch.Tensor] | None = None,
+    force_uniform_router: bool = False,
 ) -> EvaluationResult:
     model.eval()
     results = []
@@ -50,12 +51,16 @@ def evaluate_model(
             if shuffled_states is not None:
                 batch.market_state = shuffled_states[state_index].to(device)
             state_index += 1
-            output = model(batch)
+            output = model(batch, force_uniform_router=force_uniform_router)
             scores = output.scores.detach().cpu().numpy()
             if batch.targets is None:
                 raise ValueError("evaluation requires targets")
             targets = batch.targets.detach().cpu().numpy()
-            diagnostics = response_diagnostics(output.coefficients, model.temporal_dilations)
+            diagnostics = response_diagnostics(
+                output.coefficients,
+                model.temporal_dilations,
+                channel_mixing=model.channel_mixing,
+            )
             results.append(
                 DateEvaluation(
                     date=batch.date,

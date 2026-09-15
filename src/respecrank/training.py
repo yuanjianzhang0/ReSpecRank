@@ -33,6 +33,10 @@ class EpochRecord:
 
 def create_optimizer(model: ReSpecRank, config: ExperimentConfig) -> torch.optim.Optimizer:
     router_parameters = list(model.router.parameters())
+    if model.routing_mode == "direct":
+        router_parameters.extend(model.direct_routers.parameters())
+    if model.routing_mode == "feature":
+        router_parameters.extend(model.feature_conditioner.parameters())
     router_ids = {id(parameter) for parameter in router_parameters}
     main_parameters = [
         parameter for parameter in model.parameters() if id(parameter) not in router_ids
@@ -57,6 +61,7 @@ def _save_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
+            "implementation_version": 2,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "config": config.to_dict(),
@@ -90,10 +95,7 @@ def train_model(
         num_batches = 0
         for date_group in train_loader:
             batches = [item.to(device) for item in date_group]
-            outputs = [
-                model(item, force_uniform_router=not router_active)
-                for item in batches
-            ]
+            outputs = [model(item, force_uniform_router=not router_active) for item in batches]
             targets = [item.targets for item in batches]
             if any(target is None for target in targets):
                 raise ValueError("training requires targets")
@@ -107,6 +109,7 @@ def train_model(
                 diversity_weight=config.loss.diversity_weight,
                 huber_delta=config.loss.huber_delta,
                 response_grid_size=config.loss.response_grid_size,
+                channel_mixing=model.channel_mixing,
             )
             optimizer.zero_grad(set_to_none=True)
             terms.total.backward()
@@ -118,7 +121,9 @@ def train_model(
             accumulated["diversity"] += float(terms.diversity.detach())
             num_batches += 1
 
-        validation = evaluate_model(model, validation_loader, device)
+        validation = evaluate_model(
+            model, validation_loader, device, force_uniform_router=not router_active
+        )
         record = EpochRecord(
             epoch=epoch + 1,
             loss=accumulated["total"] / num_batches,

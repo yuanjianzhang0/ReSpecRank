@@ -11,6 +11,7 @@ def test_checkpoint_reconstructs_model(tmp_path) -> None:
     checkpoint = tmp_path / "model.pt"
     torch.save(
         {
+            "implementation_version": 2,
             "model_state": model.state_dict(),
             "config": config.to_dict(),
             "epoch": 3,
@@ -23,3 +24,12 @@ def test_checkpoint_reconstructs_model(tmp_path) -> None:
     assert payload["epoch"] == 3
     for original, loaded in zip(model.parameters(), restored.parameters(), strict=True):
         torch.testing.assert_close(original, loaded)
+
+
+def test_legacy_checkpoint_requires_retraining(tmp_path) -> None:
+    import pytest
+
+    path = tmp_path / "legacy.pt"
+    torch.save({"implementation_version": 1}, path)
+    with pytest.raises(ValueError, match="retrain"):
+        load_checkpoint(path, torch.device("cpu"))

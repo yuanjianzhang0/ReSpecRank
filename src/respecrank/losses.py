@@ -28,11 +28,8 @@ def sample_pairwise_logistic_loss(
     second = torch.randint(num_stocks - 1, (num_pairs,), device=scores.device, generator=generator)
     second = second + (second >= first).to(second.dtype)
     direction = torch.sign(targets[first] - targets[second])
-    valid = direction != 0
-    if not torch.any(valid):
-        return scores.sum() * 0.0
-    score_difference = scores[first[valid]] - scores[second[valid]]
-    return functional.softplus(-direction[valid] * score_difference).mean()
+    score_difference = scores[first] - scores[second]
+    return functional.softplus(-direction * score_difference).mean()
 
 
 def huber_regression_loss(
@@ -40,6 +37,8 @@ def huber_regression_loss(
     targets: torch.Tensor,
     delta: float = 1.0,
 ) -> torch.Tensor:
+    if scores.numel() == 0:
+        return scores.sum() * 0
     standardized_scores = cross_sectional_standardize(scores)
     return functional.huber_loss(standardized_scores, targets, delta=delta)
 
@@ -77,45 +76,66 @@ def joint_response(
     )
 
 
+def matrix_response_energy(
+    coefficients: torch.Tensor,
+    channel_mixing: torch.Tensor,
+    temporal_dilations: tuple[int, ...],
+    lambdas: torch.Tensor,
+    omegas: torch.Tensor,
+) -> torch.Tensor:
+    """||sum_pq theta_pq T_p exp(-iw d_q) W_pq||_F^2 / d.
+
+    Leading coefficient dimensions (e.g. anchors) are preserved. Contracting
+    the real W Gram matrix avoids materializing grid_size^2 channel matrices.
+    """
+    graph = chebyshev_polynomials(lambdas - 1, coefficients.shape[-2] - 1)
+    delays = omegas.new_tensor(temporal_dilations)
+    phase = torch.exp(-1j * omegas[:, None] * delays)
+    basis = torch.einsum("pl,wq->lwpq", graph.to(phase.dtype), phase).flatten(-2)
+    amplitudes = coefficients.flatten(-2)[..., None, None, :] * basis
+    maps = channel_mixing.flatten(0, 1).flatten(1)
+    gram = (maps @ maps.T) / channel_mixing.shape[-1]
+    real, imag = amplitudes.real, amplitudes.imag
+    energy = ((real @ gram) * real + (imag @ gram) * imag).sum(-1)
+    return energy.clamp_min(0)
+
+
 def spectral_diversity_loss(
     coefficient_bases: torch.Tensor,
     temporal_dilations: tuple[int, ...],
     grid_size: int = 32,
     epsilon: float = 1e-8,
+    *,
+    channel_mixing: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute basis-response diversity on a fixed lambda-omega grid."""
+    """Mean squared pair cosine of W-aware anchor envelopes."""
     if coefficient_bases.ndim == 4:
         return torch.stack(
             [
                 spectral_diversity_loss(
-                    layer_bases,
-                    temporal_dilations,
-                    grid_size,
-                    epsilon,
+                    bases, temporal_dilations, grid_size, epsilon, channel_mixing=maps
                 )
-                for layer_bases in coefficient_bases
+                for bases, maps in zip(coefficient_bases, channel_mixing, strict=True)
             ]
         ).mean()
     if coefficient_bases.ndim != 3:
-        raise ValueError(
-            "coefficient_bases must have shape [bases, graph, time] or "
-            "[layers, bases, graph, time]"
-        )
-    num_bases = coefficient_bases.shape[0]
-    if num_bases < 2:
-        return coefficient_bases.sum() * 0.0
-    lambdas = torch.linspace(0.0, 2.0, grid_size, device=coefficient_bases.device)
-    omegas = torch.linspace(0.0, torch.pi, grid_size, device=coefficient_bases.device)
-    magnitudes = torch.stack(
-        [
-            joint_response(surface, temporal_dilations, lambdas, omegas).abs().flatten()
-            for surface in coefficient_bases
-        ]
+        raise ValueError("expected [anchors, graph, delay] or [layers, anchors, graph, delay]")
+    count = coefficient_bases.shape[0]
+    if count < 2:
+        return coefficient_bases.sum() * 0
+    lambdas = torch.linspace(
+        0, 2, grid_size, device=coefficient_bases.device, dtype=coefficient_bases.dtype
     )
-    normalized = magnitudes / magnitudes.norm(dim=1, keepdim=True).clamp_min(epsilon)
-    correlations = torch.abs(normalized @ normalized.T)
-    upper = torch.triu(correlations.square(), diagonal=1).sum()
-    return 2.0 * upper / (num_bases * (num_bases - 1))
+    omegas = torch.linspace(
+        0, torch.pi, grid_size, device=coefficient_bases.device, dtype=coefficient_bases.dtype
+    )
+    energy = matrix_response_energy(
+        coefficient_bases, channel_mixing, temporal_dilations, lambdas, omegas
+    )
+    magnitudes = torch.where(energy > 0, energy.clamp_min(epsilon**2).sqrt(), 0).flatten(1)
+    normalized = functional.normalize(magnitudes, dim=1, eps=epsilon)
+    cosine = (normalized @ normalized.T).abs()
+    return 2 * cosine.square().triu(diagonal=1).sum() / (count * (count - 1))
 
 
 @dataclass
@@ -136,7 +156,11 @@ def respecrank_loss(
     diversity_weight: float = 0.01,
     huber_delta: float = 1.0,
     response_grid_size: int = 32,
+    channel_mixing: torch.Tensor | None = None,
 ) -> LossTerms:
+    valid = [torch.isfinite(target) for target in daily_targets]
+    daily_scores = [score[mask] for score, mask in zip(daily_scores, valid, strict=True)]
+    daily_targets = [target[mask] for target, mask in zip(daily_targets, valid, strict=True)]
     ranking = torch.stack(
         [
             sample_pairwise_logistic_loss(scores, targets, num_pairs)
@@ -149,10 +173,16 @@ def respecrank_loss(
             for scores, targets in zip(daily_scores, daily_targets, strict=True)
         ]
     ).mean()
-    diversity = spectral_diversity_loss(
-        coefficient_bases,
-        temporal_dilations,
-        response_grid_size,
-    )
+    if diversity_weight:
+        if channel_mixing is None:
+            raise ValueError("W-aware diversity requires channel_mixing")
+        diversity = spectral_diversity_loss(
+            coefficient_bases,
+            temporal_dilations,
+            response_grid_size,
+            channel_mixing=channel_mixing,
+        )
+    else:
+        diversity = coefficient_bases.new_zeros(())
     total = ranking + huber_weight * huber + diversity_weight * diversity
     return LossTerms(total=total, ranking=ranking, huber=huber, diversity=diversity)

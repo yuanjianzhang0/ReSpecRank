@@ -13,7 +13,6 @@ import yaml
 from respecrank.graph import positive_knn_adjacency, scaled_laplacian_edges
 from respecrank.utils import write_json
 
-
 FEATURE_NAMES = (
     "return_1d",
     "return_5d",
@@ -56,7 +55,7 @@ class PreparationConfig:
 
     def validate(self) -> None:
         if self.lookback < 20:
-            raise ValueError("lookback must be at least 20 for the stated features")
+            raise ValueError("lookback must be at least 20 for feature computation")
         if self.graph_min_observations > self.graph_window:
             raise ValueError("graph_min_observations cannot exceed graph_window")
         if len(self.split_ratios) != 3 or abs(sum(self.split_ratios) - 1.0) > 1e-6:
@@ -72,9 +71,7 @@ def _canonicalize_prices(config: PreparationConfig) -> pd.DataFrame:
     if missing_mapping:
         raise ValueError(f"missing column mappings: {missing_mapping}")
     rename = {
-        source: canonical
-        for canonical, source in config.columns.items()
-        if source in raw.columns
+        source: canonical for canonical, source in config.columns.items() if source in raw.columns
     }
     prices = raw.rename(columns=rename)
     missing = [name for name in required if name not in prices.columns]
@@ -87,9 +84,7 @@ def _canonicalize_prices(config: PreparationConfig) -> pd.DataFrame:
     prices["tradable"] = prices["tradable"].fillna(False).astype(bool)
     numeric = ["open", "high", "low", "close", "volume", "turnover"]
     prices[numeric] = prices[numeric].apply(pd.to_numeric, errors="coerce")
-    prices = prices.sort_values(["symbol", "date"]).drop_duplicates(
-        ["date", "symbol"]
-    )
+    prices = prices.sort_values(["symbol", "date"]).drop_duplicates(["date", "symbol"])
     return prices.set_index(["date", "symbol"]).sort_index()
 
 
@@ -98,9 +93,7 @@ def _canonicalize_membership(
 ) -> dict[pd.Timestamp, tuple[str, ...]]:
     raw = pd.read_csv(config.membership_csv)
     rename = {
-        source: canonical
-        for canonical, source in config.columns.items()
-        if source in raw.columns
+        source: canonical for canonical, source in config.columns.items() if source in raw.columns
     }
     membership = raw.rename(columns=rename)
     if "date" not in membership or "symbol" not in membership:
@@ -148,7 +141,8 @@ def _cross_sectional_transform(
     clipped = values.clip(low, high, axis=1)
     mean = clipped.mean(axis=0)
     std = clipped.std(axis=0, ddof=0).replace(0.0, np.nan)
-    return ((clipped - mean) / std).fillna(0.0)
+    # Constant observed features map to zero; missing observations remain missing.
+    return (clipped - mean) / std.fillna(1.0)
 
 
 def _standardize_array(values: np.ndarray, epsilon: float = 1e-8) -> np.ndarray:
@@ -172,7 +166,9 @@ class PointInTimeBuilder:
     def _build_feature_panel(self) -> pd.DataFrame:
         pieces = []
         for _, group in self.prices.groupby(level="symbol", sort=False):
-            pieces.append(_compute_symbol_features(group))
+            symbol = group.index.get_level_values("symbol")[0]
+            keys = pd.MultiIndex.from_product([self.calendar, [symbol]], names=["date", "symbol"])
+            pieces.append(_compute_symbol_features(group.reindex(keys)))
         return pd.concat(pieces).sort_index()
 
     def _build_return_panel(self) -> pd.DataFrame:
@@ -221,15 +217,23 @@ class PointInTimeBuilder:
             members, adjacency = self._graph_for_date(state_date)
             if not members:
                 return None
-            returns = self.daily_returns.loc[state_date, list(members)].to_numpy(
-                dtype=np.float64
-            )
+            returns = self.daily_returns.loc[state_date, list(members)].to_numpy(dtype=np.float64)
             finite = np.isfinite(returns)
             if finite.sum() < 2:
                 return None
             valid_returns = returns[finite]
-            market_returns.append(float(valid_returns.mean()))
-            dispersions.append(float(valid_returns.std(ddof=0)))
+            # Trend/dispersion use the date's observed PIT constituents, not
+            # graph-window eligibility.
+            observed = (
+                self.daily_returns.loc[state_date]
+                .reindex(self._members(state_date))
+                .to_numpy(dtype=np.float64)
+            )
+            observed = observed[np.isfinite(observed)]
+            if len(observed) < 2:
+                return None
+            market_returns.append(float(observed.mean()))
+            dispersions.append(float(observed.std(ddof=0)))
 
             sub_adjacency = adjacency[np.ix_(finite, finite)]
             degree = sub_adjacency.sum(axis=1)
@@ -245,9 +249,7 @@ class PointInTimeBuilder:
         market = np.asarray(market_returns)
         spectrum_energy = np.abs(np.fft.rfft(market)) ** 2
         selected = [
-            index
-            for index in self.config.low_frequency_bins
-            if index < len(spectrum_energy)
+            index for index in self.config.low_frequency_bins if index < len(spectrum_energy)
         ]
         if not selected:
             raise ValueError("low_frequency_bins has no valid bins for the state window")
@@ -265,51 +267,56 @@ class PointInTimeBuilder:
 
     def _build_item(self, date: pd.Timestamp) -> dict[str, Any] | None:
         position = self.date_position[date]
-        if position < self.config.lookback - 1 or position + 6 >= len(self.calendar):
+        if position < self.config.lookback - 1:
             return None
-        graph_members, full_adjacency = self._graph_for_date(date)
+        graph_members, _ = self._graph_for_date(date)
         if not graph_members:
             return None
         history_dates = self.calendar[position - self.config.lookback + 1 : position + 1]
-        next_date = self.calendar[position + 1]
-        exit_date = self.calendar[position + 6]
+        label_available = position + 6 < len(self.calendar)
 
         valid_symbols = []
         histories = []
         targets = []
         for graph_index, symbol in enumerate(graph_members):
-            keys = pd.MultiIndex.from_product(
-                [history_dates, [symbol]], names=["date", "symbol"]
-            )
+            keys = pd.MultiIndex.from_product([history_dates, [symbol]], names=["date", "symbol"])
             history = self.features.reindex(keys).loc[:, FEATURE_NAMES]
             current_index = pd.MultiIndex.from_tuples([(date, symbol)])
             current_quote = self.prices.reindex(current_index).iloc[0]
-            target_index = pd.MultiIndex.from_tuples(
-                [(next_date, symbol), (exit_date, symbol)]
-            )
-            target_quotes = self.prices.reindex(target_index)
             correct_length = history.shape[0] == self.config.lookback
             finite_history = np.isfinite(history.to_numpy()).all()
             if not correct_length or not finite_history:
                 continue
             if not bool(current_quote.get("tradable", False)):
                 continue
-            if target_quotes[["open"]].isna().any().any():
-                continue
-            if not target_quotes["tradable"].fillna(False).astype(bool).all():
-                continue
-            entry_open, exit_open = target_quotes["open"].to_numpy(dtype=np.float64)
-            if entry_open <= 0 or exit_open <= 0:
-                continue
             valid_symbols.append((graph_index, symbol))
             histories.append(history.to_numpy(dtype=np.float32))
-            targets.append(np.log(exit_open / entry_open))
+            # Labels cannot determine candidates, normalization, topology or state.
+            target = np.nan
+            if label_available:
+                target_index = pd.MultiIndex.from_tuples(
+                    [
+                        (self.calendar[position + 1], symbol),
+                        (self.calendar[position + 6], symbol),
+                    ]
+                )
+                target_quotes = self.prices.reindex(target_index)
+                opens = target_quotes["open"].to_numpy(dtype=np.float64)
+                tradable = target_quotes["tradable"].fillna(False).astype(bool).all()
+                if np.isfinite(opens).all() and (opens > 0).all() and tradable:
+                    target = np.log(opens[1] / opens[0])
+            targets.append(target)
 
         if len(valid_symbols) < 2:
             return None
-        graph_indices = [index for index, _ in valid_symbols]
         symbols = [symbol for _, symbol in valid_symbols]
-        adjacency = full_adjacency[np.ix_(graph_indices, graph_indices)]
+        # Select top-k within the final, past-only eligible vertex set.
+        graph_dates = self.calendar[position - self.config.graph_window + 1 : position + 1]
+        adjacency = positive_knn_adjacency(
+            self.daily_returns.loc[list(graph_dates), symbols].to_numpy(dtype=np.float64),
+            neighbors=self.config.graph_neighbors,
+            min_observations=self.config.graph_min_observations,
+        )
         edge_index, edge_weight = scaled_laplacian_edges(adjacency)
 
         feature_array = np.stack(histories)
@@ -322,7 +329,11 @@ class PointInTimeBuilder:
             feature_array[:, time_index, :] = transformed.to_numpy(dtype=np.float32)
 
         raw_targets = np.asarray(targets, dtype=np.float64)
-        relative_targets = raw_targets - raw_targets.mean()
+        labeled = np.isfinite(raw_targets)
+        standardized_targets = np.full(raw_targets.shape, np.nan, dtype=np.float32)
+        if labeled.any():
+            relative_targets = raw_targets[labeled] - raw_targets[labeled].mean()
+            standardized_targets[labeled] = _standardize_array(relative_targets)
         state = self._market_statistics(date)
         if state is None or not np.isfinite(state).all():
             return None
@@ -333,13 +344,16 @@ class PointInTimeBuilder:
             "edge_index": edge_index,
             "edge_weight": edge_weight,
             "market_state": state,
-            "targets": _standardize_array(relative_targets),
+            "targets": standardized_targets,
         }
 
     def build(self) -> dict[str, Any]:
         items = []
         for date in sorted(self.membership):
             if date not in self.date_position:
+                continue
+            # Offline supervised horizon; _build_item also supports live dates.
+            if self.date_position[date] + 6 >= len(self.calendar):
                 continue
             item = self._build_item(date)
             if item is not None:
@@ -372,9 +386,9 @@ class PointInTimeBuilder:
             split_dir.mkdir(parents=True, exist_ok=True)
             manifest_splits[split] = []
             for item in values:
-                item["market_state"] = (
-                    (item["market_state"] - state_mean) / state_std
-                ).astype(np.float32)
+                item["market_state"] = ((item["market_state"] - state_mean) / state_std).astype(
+                    np.float32
+                )
                 relative_path = f"{split}/{item['date']}.npz"
                 np.savez_compressed(output / relative_path, **item)
                 manifest_splits[split].append(relative_path)
@@ -382,6 +396,7 @@ class PointInTimeBuilder:
         manifest = {
             "splits": manifest_splits,
             "metadata": {
+                "implementation_version": 2,
                 "feature_names": list(FEATURE_NAMES),
                 "feature_dim": len(FEATURE_NAMES),
                 "lookback": self.config.lookback,
@@ -395,6 +410,8 @@ class PointInTimeBuilder:
                 "state_mean": state_mean.tolist(),
                 "state_std": state_std.tolist(),
                 "low_frequency_bins": list(self.config.low_frequency_bins),
+                "candidate_policy": "past-only eligibility; unavailable targets stay NaN",
+                "label_policy": "fixed t+1/t+6 opens; finite labels only in loss and metrics",
                 "purge_policy": "remove the final purge_dates from train and validation",
             },
         }

@@ -1,0 +1,51 @@
+seed: 42
+device: auto
+data:
+  processed_dir: data/processed
+  feature_dim: 12
+  lookback: 20
+  graph_window: 60
+  graph_min_observations: 55
+  graph_neighbors: 10
+  split_ratios:
+  - 0.6
+  - 0.2
+  - 0.2
+  purge_dates: 5
+  low_frequency_bins:
+  - 0
+  - 1
+  - 2
+model:
+  hidden_dim: 128
+  joint_layers: 2
+  graph_order: 3
+  temporal_dilations:
+  - 0
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  num_bases: 4
+  router_hidden_dim: 16
+  dropout: 0.1
+  coefficient_init_scale: 0.1
+  routing_mode: adaptive
+loss:
+  sampled_pairs: 4096
+  huber_weight: 0.1
+  diversity_weight: 0.005
+  huber_delta: 1.0
+  response_grid_size: 32
+training:
+  epochs: 80
+  dates_per_batch: 8
+  main_learning_rate: 0.001
+  router_learning_rate: 0.0003
+  weight_decay: 0.01
+  router_warmup_epochs: 5
+  gradient_clip_norm: 5.0
+  num_workers: 0
+  early_stopping_patience: null
+output_dir: outputs/diversity_005

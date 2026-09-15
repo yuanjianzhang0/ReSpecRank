@@ -18,12 +18,18 @@ from respecrank.utils import count_parameters, resolve_device, seed_everything
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="Experiment YAML path")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--output-dir", default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    if args.seed is not None:
+        config.seed = args.seed
+    if args.output_dir is not None:
+        config.output_dir = args.output_dir
     seed_everything(config.seed)
     device = resolve_device(config.device)
     train_dataset = CrossSectionDataset(config.data.processed_dir, "train")
@@ -62,4 +68,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
